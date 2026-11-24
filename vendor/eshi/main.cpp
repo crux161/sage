@@ -1,0 +1,408 @@
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+#include <sumi/sumi.h>
+#include "encoder.h"
+#include "renderer_cpu.h" 
+#include "display.h" 
+
+#ifdef USE_OPENGL
+    #include "renderer_gl.h"
+#endif
+
+#ifdef USE_CUDA
+    #include "renderer_gpu.h"
+#endif
+
+#ifdef USE_METAL
+    #include "renderer_metal.h"
+#endif
+
+#include <SDL2/SDL.h>
+#include <string>
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <atomic>
+#include <cmath> 
+#include <exception>
+#include <sys/stat.h>
+
+using namespace sumi;
+
+// GLOBAL TEXTURE
+Sampler2D iChannel0 = {0, 0, nullptr};
+
+// Global audio state
+std::atomic<float> g_audio_time(0.0f);
+static int g_sample_rate = 44100;
+static long long g_sample_index = 0;
+
+// Weak linkage for mainSound
+#if defined(__GNUC__) || defined(__clang__)
+    extern "C" __attribute__((weak)) vec2 mainSound(int samp, float time) {
+        return vec2(0.0f); 
+    }
+#else
+    extern "C" vec2 mainSound(int samp, float time) { return vec2(0.0f); }
+#endif
+
+void audio_callback(void* userdata, Uint8* stream, int len) {
+    float* fstream = (float*)stream;
+    int samples_to_write = len / sizeof(float) / 2; // Stereo Float32
+    
+    for (int i = 0; i < samples_to_write; i++) {
+        float t = (float)((double)g_sample_index / (double)g_sample_rate);
+        
+        vec2 s = mainSound((int)g_sample_index, t);
+        
+        // Soft Clipping
+        s.x = std::tanh(s.x * 0.5f); 
+        s.y = std::tanh(s.y * 0.5f);
+        
+        fstream[2*i]     = s.x; 
+        fstream[2*i + 1] = s.y;
+        
+        g_sample_index++;
+    }
+    
+    g_audio_time = (float)((double)g_sample_index / (double)g_sample_rate);
+}
+
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+
+std::string get_filename(std::string path) {
+    const size_t last_slash_idx = path.find_last_of("\\/");
+    if (std::string::npos != last_slash_idx) path.erase(0, last_slash_idx + 1);
+    const size_t period_idx = path.rfind('.');
+    if (std::string::npos != period_idx) path.erase(period_idx);
+    return path;
+}
+
+static bool file_exists(const std::string& path) {
+    struct stat info;
+    return stat(path.c_str(), &info) == 0 && (info.st_mode & S_IFREG) != 0;
+}
+
+static std::string get_directory(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    return slash == std::string::npos ? "." : path.substr(0, slash);
+}
+
+static std::string resolve_source_path(const std::string& path, const std::string& executable_path) {
+    const std::string executable_dir = get_directory(executable_path);
+    const std::string candidates[] = {
+        path,
+        "../" + path,
+        executable_dir + "/../" + path,
+        executable_dir + "/../../" + path,
+    };
+
+    for (const std::string& candidate : candidates) {
+        if (file_exists(candidate)) return candidate;
+    }
+    return "";
+}
+
+static std::string find_gpu_shader(const std::string& binary_name, const std::string& executable_path) {
+    if (binary_name == "eshi") {
+        return resolve_source_path("shader.cpp", executable_path);
+    }
+
+    // A sidecar lets shaders implemented in another host language (for example
+    // Zig) provide the portable C++/GLSL subset consumed by GPU backends.
+    std::string path = resolve_source_path("examples/gpu/" + binary_name + ".cpp", executable_path);
+    if (!path.empty()) return path;
+    return resolve_source_path("examples/" + binary_name + ".cpp", executable_path);
+}
+
+int main(int argc, char** argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    if (SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO) < 0) {
+        printf("SDL Init Failed: %s\n", SDL_GetError());
+    }
+
+    int W = 960; 
+    int H = 540;
+    const int FPS = 60;
+    
+    bool use_gpu = false;
+    bool live_mode = false;
+    // Initialize the renderer, report which backend came up, and exit without
+    // rendering. CI needs to assert that a shader actually reached the GPU
+    // backend rather than silently falling back to the CPU, and timing a
+    // 240-frame render just to read one line of output is both slow and
+    // flaky.
+    bool validate_only = false;
+    EncoderBackend encoder_backend = EncoderBackend::Auto;
+    EncoderCodec   encoder_codec = EncoderCodec::H264;
+    std::string output_name = "output.mp4";
+
+    std::string bin_name = "eshi";
+    if (argc > 0) {
+        bin_name = get_filename(argv[0]);
+        if (!bin_name.empty()) {
+            output_name = bin_name + ".mp4";
+        }
+    }
+
+    const std::string shader_path = find_gpu_shader(bin_name, argc > 0 ? argv[0] : "eshi");
+
+    for(int i=1; i<argc; i++){
+        std::string arg = argv[i];
+        if(arg == "--gpu")  use_gpu = true;
+        if(arg == "--live") live_mode = true;
+        if(arg == "--validate") validate_only = true;
+        if(arg == "--hevc") encoder_codec = EncoderCodec::HEVC;
+        if(arg == "--encoder" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "hw" || mode == "hardware") encoder_backend = EncoderBackend::Hardware;
+            else if (mode == "sw" || mode == "software") encoder_backend = EncoderBackend::Software;
+            else if (mode == "auto") encoder_backend = EncoderBackend::Auto;
+            else fprintf(stderr, "unknown --encoder mode '%s' (auto|hw|sw)\n", mode.c_str());
+        }
+        if(arg == "--res") {
+            if (i + 1 < argc) {
+                std::string res_str = argv[++i]; 
+                size_t x_pos = res_str.find('x');
+                if (x_pos != std::string::npos) {
+                    try {
+                        W = std::stoi(res_str.substr(0, x_pos));
+                        H = std::stoi(res_str.substr(x_pos + 1));
+                    } catch (...) {}
+                }
+            }
+        }
+    }
+    
+    SDL_AudioDeviceID audio_device = 0;
+    if (live_mode) {
+        SDL_AudioSpec want, have;
+        SDL_zero(want);
+        want.freq = g_sample_rate;
+        want.format = AUDIO_F32; 
+        want.channels = 2;       
+        want.samples = 4096;     
+        want.callback = audio_callback;
+        
+        audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (audio_device == 0) {
+            printf("Failed to open audio: %s\n", SDL_GetError());
+        } else {
+            printf("Audio Initialized: %d Hz, %d Channels\n", have.freq, have.channels);
+            g_sample_rate = have.freq;
+            SDL_PauseAudioDevice(audio_device, 0); 
+        }
+    }
+
+    const char* texPath = "texture.jpg"; 
+    int tw=0, th=0, tn=0;
+    float* texData = stbi_loadf(texPath, &tw, &th, &tn, 4); 
+    
+    vec4* vecData = nullptr;
+    if (texData) {
+        printf("Texture loaded: %s [%dx%d]\n", texPath, tw, th);
+        vecData = new vec4[tw * th];
+        for (int i = 0; i < tw * th; i++) {
+            vecData[i] = vec4(texData[i*4+0], texData[i*4+1], texData[i*4+2], texData[i*4+3]);
+        }
+        iChannel0.w = tw;
+        iChannel0.h = th;
+        iChannel0.data = vecData; 
+    } else {
+        printf("Texture not found: %s (Will use black)\n", texPath);
+    }
+
+    printf("Initializing Engine...\n");
+    if (live_mode) printf("Mode: Live Window [%dx%d]\n", W, H);
+    else           printf("Mode: File Render -> %s [%dx%d]\n", output_name.c_str(), W, H);
+
+    CpuRenderer* cpu_renderer = nullptr;
+    
+    #ifdef USE_OPENGL
+    GlRenderer* gl_renderer = nullptr;
+    #endif
+
+    #ifdef USE_CUDA
+    GpuRenderer* gpu_renderer = nullptr;
+    #endif
+
+    #ifdef USE_METAL
+    MetalRenderer* metal_renderer = nullptr;
+    #endif
+    
+    if (use_gpu) {
+        bool gpu_init = false;
+        #ifdef USE_CUDA
+        printf("Initializing CUDA Renderer...\n");
+        gpu_renderer = new GpuRenderer(W, H);
+        if (vecData) uploadTextureToGPU(tw, th, vecData);
+        gpu_init = true;
+        #endif
+
+        #ifdef USE_OPENGL
+        if (!gpu_init) { 
+            if (shader_path.empty()) {
+                fprintf(stderr,
+                        "[OpenGL ERROR] No GPU shader source for '%s'. Expected "
+                        "examples/gpu/%s.cpp or examples/%s.cpp.\n",
+                        bin_name.c_str(), bin_name.c_str(), bin_name.c_str());
+            } else {
+                printf("Initializing OpenGL Renderer with shader: %s\n", shader_path.c_str());
+                try {
+                    gl_renderer = new GlRenderer(W, H, shader_path.c_str(), texData, tw, th);
+                    gpu_init = true;
+                } catch (const std::exception& error) {
+                    // Leaving gpu_init false drops through to the CPU renderer
+                    // below. A shader this backend cannot build is a reason to
+                    // render it more slowly, not a reason to produce black
+                    // frames or abort.
+                    fprintf(stderr, "[OpenGL ERROR] %s\n", error.what());
+                }
+            }
+        }
+        #endif
+
+	#ifdef USE_METAL
+        if (!gpu_init) {
+            if (shader_path.empty()) {
+                fprintf(stderr,
+                        "[Metal ERROR] No GPU shader source for '%s'. Expected "
+                        "examples/gpu/%s.cpp or examples/%s.cpp.\n",
+                        bin_name.c_str(), bin_name.c_str(), bin_name.c_str());
+            } else {
+                printf("Initializing Metal Renderer with shader: %s\n", shader_path.c_str());
+                try {
+                    metal_renderer = new MetalRenderer(W, H, shader_path.c_str(), texData, tw, th);
+                    gpu_init = true;
+                } catch (const std::exception& error) {
+                    fprintf(stderr, "[Metal ERROR] %s\n", error.what());
+                }
+            }
+        }
+        #endif
+
+        if (!gpu_init) {
+            printf("⚠️  GPU renderer unavailable for this shader. Falling back to CPU.\n");
+            cpu_renderer = new CpuRenderer(W, H);
+        }
+    } else {
+        printf("Initializing CPU Renderer (OpenMP)\n");
+        cpu_renderer = new CpuRenderer(W, H);
+    }
+    
+    if (texData) stbi_image_free(texData);
+
+    int exit_code = 0;
+
+    // cpu_renderer is allocated only when no GPU backend is active — either
+    // none was asked for, or the one that was asked for failed to build the
+    // shader and fell through. That makes it the authoritative answer to
+    // "did the GPU path work", which is exactly what --validate reports.
+    const bool gpu_active = (cpu_renderer == nullptr);
+
+    if (validate_only) {
+        const char* backend = "cpu";
+        #ifdef USE_CUDA
+        if (gpu_renderer) backend = "cuda";
+        #endif
+        #ifdef USE_OPENGL
+        if (gl_renderer) backend = "opengl";
+        #endif
+        #ifdef USE_METAL
+        if (metal_renderer) backend = "metal";
+        #endif
+
+        if (use_gpu && !gpu_active) {
+            printf("[validate] FAIL %s: requested GPU, fell back to CPU\n", bin_name.c_str());
+            exit_code = 1;
+        } else {
+            printf("[validate] ok %s: backend=%s\n", bin_name.c_str(), backend);
+        }
+    } else if (live_mode) {
+        Display window(W, H, "Eshi Live Preview");
+        auto start_time_clock = std::chrono::high_resolution_clock::now();
+        
+        while (window.isOpen()) {
+            int stride;
+            uint8_t* pixels = window.get_pixel_buffer(stride);
+            
+            float time;
+            if (audio_device != 0) {
+                time = g_audio_time;
+            } else {
+                auto now = std::chrono::high_resolution_clock::now();
+                std::chrono::duration<float> elapsed = now - start_time_clock;
+                time = elapsed.count();
+            }
+            
+            #ifdef USE_CUDA
+                if (gpu_renderer){ gpu_renderer->renderFrame(pixels, stride, time); }
+                   else
+            #endif
+            #ifdef USE_OPENGL
+                if (gl_renderer){ gl_renderer->renderFrame(pixels, stride, time); }
+                   else
+            #endif
+
+	    #ifdef USE_METAL
+	        if (metal_renderer){ metal_renderer->renderFrame(pixels, stride, time); }
+	            else
+	    #endif
+
+            if (cpu_renderer){ cpu_renderer->renderFrame(pixels, stride, time); }
+            
+            window.submit_frame();
+
+            // FIXED: Yield CPU time to audio thread
+            SDL_Delay(1); 
+        }
+        
+        if (audio_device != 0) SDL_CloseAudioDevice(audio_device);
+
+    } else {
+        const int FRAMES = 240;
+        SimpleEncoder video(output_name.c_str(), W, H, FPS, encoder_backend, encoder_codec);
+        
+        for (int i = 0; i < FRAMES; ++i) {
+            float time = (float)i / (float)FPS;
+            int stride;
+            uint8_t* pixels = video.get_pixel_buffer(stride);
+
+            #ifdef USE_CUDA
+            if (gpu_renderer) gpu_renderer->renderFrame(pixels, stride, time);
+            else 
+            #endif
+            #ifdef USE_OPENGL
+            if (gl_renderer) gl_renderer->renderFrame(pixels, stride, time);
+            else 
+            #endif
+            #ifdef USE_METAL
+            if (metal_renderer) metal_renderer->renderFrame(pixels, stride, time);
+            else
+            #endif
+            if (cpu_renderer) cpu_renderer->renderFrame(pixels, stride, time);
+
+            video.submit_frame();
+        }
+        printf("\nDone.\n");
+    }
+
+    if (cpu_renderer) delete cpu_renderer;
+    #ifdef USE_OPENGL
+    if (gl_renderer) delete gl_renderer;
+    #endif
+    #ifdef USE_CUDA
+    if (gpu_renderer) delete gpu_renderer;
+    #endif
+    #ifdef USE_METAL
+    if (metal_renderer) delete metal_renderer;
+    #endif
+    if (vecData) delete[] vecData;
+    
+    SDL_Quit();
+
+    return exit_code;
+}

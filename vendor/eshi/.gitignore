@@ -1,0 +1,73 @@
+# --- Build Artifacts (Windows) ---
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.dll
+win_env.bat
+restore_deps.bat
+update_thumbnails.sh
+clean.py
+*.bak
+*.o
+*.o.tmp
+.zig-cache/
+zig-out/
+
+# --- Extras ---
+VENDORED
+sumi
+/libsumi/
+
+# --- res ---
+resources/gl3d/
+resources/gl2d/
+
+# vcpkg
+vcpkg_installed/
+vcpkg/
+
+
+# --- CUDA Intermediate Files ---
+# These are the weird "tmpxft" files you saw in the logs
+*.cudafe*
+*.fatbin*
+*.ptx
+*.cubin
+tmpxft_*
+*.i
+*.ii
+*.gpu
+
+# --- Directories ---
+build/
+bin/
+logs/
+x64/
+Debug/
+Release/
+x/
+
+# --- IDE / Editor Settings ---
+.vs/
+.vscode/
+*.user
+*.suo
+
+# --- Output Media (Don't commit 100MB videos!) ---
+*.mp4
+*.avi
+*.png
+*.jpg
+# Exception: Uncomment the next line if you want to keep texture assets
+# !texture.jpg
+
+# --- OS Junk ---
+Thumbs.db
+.DS_Store
+
+# Larimar reference material — untracked loose copies, not dependencies
+resources/gyosho/
+resources/SumiC/
